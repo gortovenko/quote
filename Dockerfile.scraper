@@ -1,0 +1,31 @@
+FROM golang:1.23-alpine AS builder
+
+ENV CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+WORKDIR /app
+
+RUN apk update && apk add --no-cache git
+
+COPY go.mod go.sum ./
+
+RUN go mod download
+
+COPY . .
+
+RUN mkdir -p /app/bin && go build -o /app/bin/scraper ./scraper/scraper_main.go
+
+
+FROM alpine:latest
+
+WORKDIR /root/
+
+RUN apk update && apk add --no-cache ca-certificates
+
+COPY --from=builder /app/bin/scraper .
+COPY .env .
+
+RUN chmod +x scraper
+
+CMD ["./scraper"]

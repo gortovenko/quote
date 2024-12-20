@@ -1,0 +1,270 @@
+name: Deploy AWS Infrastructure and Applications
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+    
+      
+      - name: Generate terraform.tfvars Securely
+        run: |
+          cat <<EOF > infra/tf-live/production/terraform.tfvars
+          region             = "${{ secrets.REGION }}"
+          ecs_cluster_name   = "${{ secrets.ECS_CLUSTER_NAME }}"
+          vpc_cidr           = "${{ secrets.VPC_CIDR }}"
+          public_subnet_cidrs  = ["${{ secrets.PUBLIC_SUBNET_1 }}", "${{ secrets.PUBLIC_SUBNET_2 }}"]
+          private_subnet_cidrs = ["${{ secrets.PRIVATE_SUBNET_1 }}", "${{ secrets.PRIVATE_SUBNET_2 }}"]
+          redis_engine_version = "${{ secrets.REDIS_ENGINE_VERSION }}"
+          redis_cluster_id     = "${{ secrets.REDIS_CLUSTER_ID }}"
+          lambda_function_name = "${{ secrets.LAMBDA_FUNCTION_NAME }}"
+          lambda_handler       = "${{ secrets.LAMBDA_HANDLER }}"
+          lambda_runtime       = "${{ secrets.LAMBDA_RUNTIME }}"
+          lambda_source_path   = "${{ secrets.LAMBDA_SOURCE_PATH }}"
+          api_name             = "${{ secrets.API_NAME }}"
+          api_stage_name       = "${{ secrets.API_STAGE_NAME }}"
+          ecs_service_name     = "${{ secrets.ECS_SERVICE_NAME }}"
+          ecs_task_family      = "${{ secrets.ECS_TASK_FAMILY }}"
+          ecs_container_name   = "${{ secrets.ECS_CONTAINER_NAME }}"
+          ecs_container_image  = "${{ secrets.ECS_CONTAINER_IMAGE }}"
+          ecs_container_port   = ${{ secrets.ECS_CONTAINER_PORT }}
+          repository_name      = "${{ secrets.REPOSITORY_NAME }}"
+          run_local_mode       = false
+          environment          = "${{ secrets.ENVIRONMENT }}"
+          ecs_task_role_name   = "${{ secrets.ECS_TASK_ROLE_NAME }}"
+          EOF
+
+      - name: Generate prod.tfvars Securely
+        run: |
+          cat <<EOF > infra/tf-live/production/prod.tfvars
+          secrets_name   = "${{ secrets.SECRETS_NAME }}"
+          cache_provider = "${{ secrets.CACHE_PROVIDER }}"
+          server_address = "${{ secrets.SERVER_ADDRESS }}"
+          base_url       = "${{ secrets.BASE_URL }}"
+          default_count  = 100
+          environment    = "${{ secrets.ENVIRONMENT }}"
+          EOF
+        
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.9.8
+
+      - name: Initialize Terraform
+        working-directory: infra/tf-live/production
+        run: terraform init 
+        
+      - name: Validate Terraform
+        working-directory: infra/tf-live/production
+        run: terraform validate
+
+      - name: Plan Terraform Changes
+        working-directory: infra/tf-live/production
+        env:
+           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+           terraform plan \
+           -var-file="terraform.tfvars" \
+           -var-file="prod.tfvars"
+
+      - name: Apply Terraform Changes for ECR Module
+        working-directory: infra/tf-live/production
+        env:
+            AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+            terraform apply \
+            -target=module.ecr \
+            -target=module.secrets_manager \
+            -target=module.s3 \
+            -target=module.vpc \
+            -var-file="terraform.tfvars" \
+            -var-file="prod.tfvars" \
+            -parallelism=10 \
+            -auto-approve
+      
+      - name: Package Lambda Function
+        run: |
+            cd lambda
+            GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o main main.go
+            zip -j function.zip main
+            cd ..
+
+      - name: Login to Amazon ECR
+        run: |
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          
+      - name: Build and Push Docker Image
+        run: |
+            docker build -t ${{ secrets.REPOSITORY_NAME }} -f Dockerfile.scraper .
+            docker tag ${{ secrets.REPOSITORY_NAME }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.REGION }}.amazonaws.com/${{ secrets.REPOSITORY_NAME }}:latest
+            docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.REGION }}.amazonaws.com/${{ secrets.REPOSITORY_NAME }}:latest
+    
+      - name: Apply Terraform Changes
+        working-directory: infra/tf-live/production
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          terraform apply \
+          -var-file="terraform.tfvars" \
+          -var-file="prod.tfvars" \
+          -parallelism=10 \
+          -auto-approve
+
+  verify-infrastructure:
+    name: Verify Infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+    needs: deploy-infrastructure
+    strategy:
+     matrix:
+      verify-type: [ecs, lambda]
+    steps:
+      - name: Verify ECS Cluster
+        if: matrix.verify-type == 'ecs'
+        run: |
+            aws ecs describe-clusters --clusters ${{ secrets.ECS_CLUSTER_NAME }} --region ${{ secrets.REGION }}
+
+      - name: Verify Lambda Function
+        if: matrix.verify-type == 'lambda'
+        run: |
+            aws lambda get-function --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} --region ${{ secrets.REGION }}
+            
+  deploy-applications:
+    name: Deploy Applications
+    runs-on: ubuntu-latest
+    environment: production
+    needs: verify-infrastructure
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Update ECS Service
+        run: |
+          aws ecs update-service --cluster ${{ secrets.ECS_CLUSTER_NAME }} --service ${{ secrets.ECS_SERVICE_NAME }} --force-new-deployment --region ${{ secrets.REGION }}
+
+      - name: Verify ECS Service Health
+        run: |
+          CLUSTER_NAME="${{ secrets.ECS_CLUSTER_NAME }}"
+          SERVICE_NAME="${{ secrets.ECS_SERVICE_NAME }}"
+          TASKS=$(aws ecs list-tasks --cluster $CLUSTER_NAME --service-name $SERVICE_NAME --query 'taskArns[]' --output text --region ${{ secrets.REGION }})
+          for TASK in $TASKS; do
+            STATUS=$(aws ecs describe-tasks --cluster $CLUSTER_NAME --tasks $TASK --query 'tasks[0].lastStatus' --output text --region ${{ secrets.REGION }})
+            echo "Task $TASK is $STATUS"
+          done
+
+      - name: Deploy Lambda Function
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --zip-file fileb://function.zip \
+            --region ${{ secrets.REGION }}
+    
+  test-deployment:
+    name: Test Deployment
+    runs-on: ubuntu-latest
+    environment: production
+    needs: deploy-applications
+    strategy:
+     matrix:
+      test-type: [api, lambda]
+    steps:
+      - name: Test API Endpoint
+        if: matrix.test-type == 'api'
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.TEST_ENDPOINT}})
+          if [ $RESPONSE -ne 200 ]; then
+            echo "API test failed with response code $RESPONSE"
+            exit 1
+          else
+            echo "API test passed with response code $RESPONSE"
+          fi
+      - name: Test Lambda Function
+        if: matrix.test-type == 'lambda'
+        run: |
+          RESPONSE=$(aws lambda invoke --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} --region ${{ secrets.AWS_REGION }} response.json)
+          STATUS=$(jq -r '.StatusCode' response.json)
+          if [ $STATUS -ne 200 ]; then
+            echo "Lambda test failed with status code $STATUS"
+            exit 1
+          else
+            echo "Lambda test passed with status code $STATUS"
+          fi
+
+  rollback-infrastructure:
+    name: Rollback ECS & Lambda
+    runs-on: ubuntu-latest
+    environment: production
+    strategy: 
+     matrix:
+      rollback-type: [ecs, lambda]
+    if: failure()
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Rollback ECS to Previous Container Version
+        if: matrix.rollback-type == 'ecs'
+        run: |
+          if [ -z "${{ secrets.PREVIOUS_TASK_DEFINITION }}" ]; then
+            echo "Previous task definition not defined. Rollback aborted."
+            exit 1
+          else
+            aws ecs update-service \
+              --cluster ${{ secrets.ECS_CLUSTER_NAME }} \
+              --service ${{ secrets.ECS_SERVICE_NAME }} \
+              --force-new-deployment \
+              --region ${{ secrets.AWS_REGION }} \
+              --task-definition ${{ secrets.PREVIOUS_TASK_DEFINITION }}
+            echo "ECS service rolled back to previous task definition: ${{ secrets.PREVIOUS_TASK_DEFINITION }}"
+          fi
+
+      - name: Rollback Lambda to Stable Version
+        if: matrix.rollback-type == 'lambda'
+        run: |
+          STABLE_VERSION=$(aws lambda list-versions-by-function \
+            --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+            --region ${{ secrets.AWS_REGION }} \
+            --query "Versions[?Description=='stable'].Version" \
+            --output text)
+
+          if [ -z "$STABLE_VERSION" ]; then
+            echo "No stable version available for rollback"
+            exit 1
+          else
+            aws lambda update-alias \
+              --function-name ${{ secrets.LAMBDA_FUNCTION_NAME }} \
+              --name stable \
+              --function-version $STABLE_VERSION \
+              --region ${{ secrets.AWS_REGION }}
+            echo "Lambda function has been rolled back to version $STABLE_VERSION"
+          fi
